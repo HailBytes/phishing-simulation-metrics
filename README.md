@@ -75,10 +75,11 @@ This surfaces organizational risk concentration. A company-average 6% click rate
 ## Repository Structure
 
 ```
-/dashboards/       - Importable Grafana, Looker Studio, Metabase configs
-/scripts/          - Python scripts for GoPhish data export, ROI calculation, variance analysis
+/dashboards/       - Importable Grafana JSON dashboard + Looker Studio and Metabase setup guides
+/scripts/          - Python scripts for GoPhish/SAT data export, ROI calculation, variance analysis
 /docs/             - Benchmarks, methodology, executive reporting templates
 /templates/        - Quarterly review and board deck markdown templates
+requirements.txt   - Python dependencies (Python 3.9+ required)
 ```
 
 ---
@@ -87,7 +88,7 @@ This surfaces organizational risk concentration. A company-average 6% click rate
 
 All five of the metrics above — click rate trend, report rate, time-to-report, repeat offenders, and department variance — are tracked automatically in **[HailBytes SAT](https://hailbytes.com)**, with pre-built dashboards and board-ready export.
 
-**This repo helps you build them yourself if you're self-hosting GoPhish.** The scripts here pull from the GoPhish API and calculate the same metrics. The dashboard templates work with open-source BI tools.
+**This repo helps you build them yourself if you're self-hosting GoPhish or HailBytes SAT.** The SAT export script pulls from the SAT API and outputs the same format as the GoPhish script, so all downstream analysis scripts work without modification.
 
 If you reach the point where maintaining the measurement infrastructure costs more than the program itself, that's typically when teams move to a managed platform.
 
@@ -96,15 +97,26 @@ If you reach the point where maintaining the measurement infrastructure costs mo
 ## Quick Start
 
 ```bash
-# 1. Export your GoPhish data
-python scripts/gophish-export.py --api-key YOUR_KEY --output campaigns.json
+pip install -r requirements.txt
 
-# 2. Calculate ROI
+# ── GoPhish self-hosted ──────────────────────────────────────────────────────
+export GOPHISH_API_KEY=your_key_here
+python scripts/gophish-export.py --host https://localhost:3333 --output campaigns.json
+
+# ── HailBytes SAT ────────────────────────────────────────────────────────────
+# Find your API key in SAT admin UI → Settings → API
+export SAT_API_KEY=your_key_here
+python scripts/hailbytes-sat-export.py --host https://sat.yourcompany.com --output campaigns.json
+
+# ── Downstream analysis (same commands for both sources) ─────────────────────
 python scripts/calculate-roi.py --data campaigns.json
 
-# 3. Identify high-risk departments
 python scripts/department-variance.py --data campaigns.json
+# Optional: adjust the repeat-offender rolling window (default 90 days)
+python scripts/department-variance.py --data campaigns.json --window 60
 ```
+
+**Grafana dashboard:** Import `dashboards/grafana-gophish.json` into Grafana 9+. Requires the [Infinity datasource plugin](https://grafana.com/grafana/plugins/yesoreyeram-infinity-datasource/). Set the `gophish_host` and `api_key` template variables after import.
 
 See [`/scripts/`](scripts/) for full documentation on each script.
 

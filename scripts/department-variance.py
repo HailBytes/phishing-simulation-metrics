@@ -6,10 +6,17 @@ Identify high-risk departments in GoPhish campaign data.
 Calculates click rate, report rate, repeat offender %, and risk score
 per department (using the "position" field in GoPhish recipient data).
 
+Department field convention:
+    This script reads the "position" field from each recipient. If you
+    populate position as "Dept|Role" (e.g., "Finance|Manager"), the dept
+    is extracted from the left side. Otherwise the full position value is
+    used as-is. Set this consistently in your GoPhish target groups.
+
 Usage:
     python department-variance.py --data campaigns.json
     python department-variance.py --data campaigns.json --output variance-report.json
     python department-variance.py --data campaigns.json --threshold 10  # flag depts above 10% click rate
+    python department-variance.py --data campaigns.json --window 60     # 60-day repeat offender window
 
 Requirements:
     pip install tabulate
@@ -19,7 +26,7 @@ import argparse
 import json
 import sys
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 try:
@@ -34,15 +41,66 @@ def load_campaigns(path: str) -> list[dict]:
         return json.load(f)
 
 
+def parse_ts(s: str | None) -> datetime | None:
+    """Parse an ISO 8601 timestamp string (with or without Z suffix) to UTC datetime."""
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
 def extract_department(recipient: dict) -> str:
-    """Infer department from position field. Adjust for your GoPhish setup."""
+    """
+    Infer department from position field.
+
+    Supports two conventions:
+      - "Finance"           → department is "Finance"
+      - "Finance|Manager"   → department is "Finance" (role stripped)
+    """
     position = recipient.get("position", "").strip()
     if not position:
         return "Unknown"
-    # If position contains dept|role (common GoPhish convention), split on |
     if "|" in position:
         return position.split("|")[0].strip()
     return position
+
+
+def _find_repeat_offenders(
+    campaigns: list[dict], window_days: int
+) -> set[str]:
+    """
+    Return the set of employee emails who clicked in 2+ campaigns within
+    any rolling window of `window_days` days.
+    """
+    employee_click_timestamps: dict[str, list[datetime]] = defaultdict(list)
+
+    for campaign in campaigns:
+        for r in campaign.get("recipients", []):
+            if r.get("status") not in ("Clicked Link", "Submitted Data"):
+                continue
+            ts = parse_ts(r.get("click_time"))
+            if ts is None:
+                # Fall back to campaign launch date when click_time is missing
+                ts = parse_ts(campaign.get("launch_date"))
+            if ts is not None:
+                email = r.get("email", "unknown")
+                employee_click_timestamps[email].append(ts)
+
+    repeat_offenders: set[str] = set()
+    cutoff = timedelta(days=window_days)
+
+    for email, timestamps in employee_click_timestamps.items():
+        if len(timestamps) < 2:
+            continue
+        for t in sorted(timestamps):
+            window_clicks = sum(1 for other in timestamps if timedelta(0) <= other - t <= cutoff)
+            if window_clicks >= 2:
+                repeat_offenders.add(email)
+                break
+
+    return repeat_offenders
 
 
 def analyze_departments(campaigns: list[dict], window_days: int = 90) -> dict:
@@ -56,17 +114,15 @@ def analyze_departments(campaigns: list[dict], window_days: int = 90) -> dict:
             "clicks": 0,
             "reports": 0,
             "employees_seen": set(),
-            "employee_click_counts": defaultdict(int),
             "report_times_seconds": [],
         }
 
     dept_stats: dict[str, dict] = defaultdict(_empty_dept)
 
-    # Track click timestamps per employee for repeat offender window calc
-    employee_clicks: dict[str, list[str]] = defaultdict(list)
+    repeat_offender_emails = _find_repeat_offenders(campaigns, window_days)
 
     for campaign in campaigns:
-        launch_date = campaign.get("launch_date", "")
+        launch_date = campaign.get("launch_date")
         for r in campaign.get("recipients", []):
             dept = extract_department(r)
             email = r.get("email", "unknown")
@@ -76,23 +132,21 @@ def analyze_departments(campaigns: list[dict], window_days: int = 90) -> dict:
 
             if r.get("status") in ("Clicked Link", "Submitted Data"):
                 dept_stats[dept]["clicks"] += 1
-                dept_stats[dept]["employee_click_counts"][email] += 1
-                if r.get("click_time"):
-                    employee_clicks[email].append(r["click_time"])
 
             if r.get("reported"):
                 dept_stats[dept]["reports"] += 1
-                if r.get("click_time") and r.get("report_time"):
-                    try:
-                        click_dt = datetime.fromisoformat(r["click_time"].rstrip("Z"))
-                        report_dt = datetime.fromisoformat(r["report_time"].rstrip("Z"))
-                        delta = (report_dt - click_dt).total_seconds()
+
+                report_ts = parse_ts(r.get("report_time"))
+                if report_ts is not None:
+                    # Use click_time as the reference when available (reporter
+                    # clicked then reported). Fall back to campaign launch_date
+                    # for reporters who identified the phish without clicking.
+                    ref_ts = parse_ts(r.get("click_time")) or parse_ts(launch_date)
+                    if ref_ts is not None:
+                        delta = (report_ts - ref_ts).total_seconds()
                         if 0 < delta < 86400:  # Exclude outliers > 24h
                             dept_stats[dept]["report_times_seconds"].append(delta)
-                    except (ValueError, TypeError):
-                        pass
 
-    # Compute repeat offenders within any 90-day window (simplified: across all campaigns)
     results = {}
     company_total_sends = sum(v["total_sends"] for v in dept_stats.values())
     company_total_clicks = sum(v["clicks"] for v in dept_stats.values())
@@ -107,15 +161,15 @@ def analyze_departments(campaigns: list[dict], window_days: int = 90) -> dict:
         click_rate = round(clicks / total * 100, 2) if total else 0
         report_rate = round(reports / total * 100, 2) if total else 0
 
-        # Repeat offenders: employees with 2+ clicks across all campaigns
-        repeat_offenders = sum(1 for count in stats["employee_click_counts"].values() if count >= 2)
+        repeat_offenders = sum(
+            1 for email in stats["employees_seen"]
+            if email in repeat_offender_emails
+        )
         repeat_offender_pct = round(repeat_offenders / employees * 100, 1) if employees else 0
 
-        # Median time-to-report
         times = sorted(stats["report_times_seconds"])
         median_time_min = round(times[len(times) // 2] / 60, 1) if times else None
 
-        # Risk variance vs. company average
         variance = round(click_rate - company_avg_click_rate, 2)
         risk_level = (
             "CRITICAL" if click_rate > company_avg_click_rate * 1.5
@@ -141,14 +195,17 @@ def analyze_departments(campaigns: list[dict], window_days: int = 90) -> dict:
 
     return {
         "company_avg_click_rate_pct": round(company_avg_click_rate, 2),
+        "repeat_offender_window_days": window_days,
         "total_campaigns_analyzed": len(campaigns),
         "departments": dict(sorted(results.items(), key=lambda x: x[1]["click_rate_pct"], reverse=True)),
     }
 
 
 def print_table(analysis: dict, threshold: Optional[float] = None):
+    window = analysis.get("repeat_offender_window_days", 90)
     print(f"\nCompany average click rate: {analysis['company_avg_click_rate_pct']}%")
-    print(f"Campaigns analyzed: {analysis['total_campaigns_analyzed']}\n")
+    print(f"Campaigns analyzed: {analysis['total_campaigns_analyzed']} "
+          f"(repeat offender window: {window} days)\n")
 
     rows = []
     for dept, stats in analysis["departments"].items():
@@ -171,13 +228,11 @@ def print_table(analysis: dict, threshold: Optional[float] = None):
     if HAS_TABULATE:
         print(tabulate(rows, headers=headers, tablefmt="rounded_outline"))
     else:
-        # Fallback: simple formatting
         print("  ".join(f"{h:<18}" for h in headers))
         print("─" * 120)
         for row in rows:
             print("  ".join(f"{str(v):<18}" for v in row))
 
-    # Flag departments requiring intervention
     critical = [d for d, s in analysis["departments"].items() if s["risk_level"] == "CRITICAL"]
     high_repeat = [d for d, s in analysis["departments"].items() if s["repeat_offender_pct"] > 8]
 
@@ -194,12 +249,18 @@ def main():
     parser.add_argument("--data", required=True, help="Path to campaigns.json from gophish-export.py")
     parser.add_argument("--output", help="Save full analysis to JSON file")
     parser.add_argument("--threshold", type=float, help="Only show departments above this click rate %%")
+    parser.add_argument(
+        "--window",
+        type=int,
+        default=90,
+        help="Rolling window in days for repeat offender detection (default: 90)",
+    )
     args = parser.parse_args()
 
     campaigns = load_campaigns(args.data)
     print(f"Analyzing {len(campaigns)} campaign(s)...")
 
-    analysis = analyze_departments(campaigns)
+    analysis = analyze_departments(campaigns, window_days=args.window)
 
     print_table(analysis, threshold=args.threshold)
 
