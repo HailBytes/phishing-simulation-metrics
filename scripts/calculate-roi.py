@@ -192,9 +192,9 @@ def main():
         parser.error("Provide --data OR both --baseline-click-rate and --current-click-rate")
         sys.exit(1)
 
-    if args.baseline_click_rate:
+    if args.baseline_click_rate is not None:
         baseline = args.baseline_click_rate
-    if args.current_click_rate:
+    if args.current_click_rate is not None:
         current = args.current_click_rate
 
     result = calculate_roi(
